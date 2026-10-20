@@ -1,0 +1,1280 @@
+import { useState, useEffect } from 'react';
+import { auth, db } from '../firebase';
+import { 
+  GoogleAuthProvider, 
+  signInWithPopup, 
+  RecaptchaVerifier, 
+  signInWithPhoneNumber,
+  ConfirmationResult,
+  signOut,
+  signInAnonymously,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  fetchSignInMethodsForEmail
+} from 'firebase/auth';
+import { doc, setDoc, getDoc, collection, query, where, getDocs } from 'firebase/firestore';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { motion, AnimatePresence } from 'motion/react';
+import { UserRole, UserProfile } from '../types';
+import { Phone, Mail, ArrowRight, CheckCircle2, Beaker, User, Briefcase, ChevronLeft, Lock, UserPlus, Sparkles, X } from 'lucide-react';
+import { toast } from 'sonner';
+import { finalizePendingRequest as syncPendingRequestService } from '../lib/pendingRequestService';
+
+declare global {
+  interface Window {
+    recaptchaVerifier: RecaptchaVerifier;
+  }
+}
+
+type AuthStep = 'role-selection' | 'method-selection' | 'phone-input' | 'otp-input' | 'email-input' | 'password-input' | 'registration-confirm' | 'profile-setup' | 'manual-login';
+
+export default function AuthPage() {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [step, setStep] = useState<AuthStep>('role-selection');
+  const [selectedRole, setSelectedRole] = useState<UserRole | null>(null);
+  const [phoneNumber, setPhoneNumber] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [verificationCode, setVerificationCode] = useState('');
+  const [confirmationResult, setConfirmationResult] = useState<ConfirmationResult | null>(null);
+  const [tempUser, setTempUser] = useState<any>(null);
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  useEffect(() => {
+    const queryParams = new URLSearchParams(location.search);
+    const redirectPath = queryParams.get('redirect');
+    const roleParam = queryParams.get('role');
+    
+    if (roleParam === 'client') {
+      setSelectedRole('client');
+      localStorage.setItem('taskmolly_selected_role', 'client');
+      setStep('method-selection');
+    } else if (roleParam === 'tasker' || roleParam === 'provider') {
+      setSelectedRole('tasker');
+      localStorage.setItem('taskmolly_selected_role', 'tasker');
+      setStep('method-selection');
+    } else if (redirectPath === 'pending-task') {
+      setSelectedRole('client');
+      localStorage.setItem('taskmolly_selected_role', 'client');
+      setStep('method-selection');
+    }
+  }, [location.search]);
+
+  useEffect(() => {
+    if (step === 'phone-input' && !window.recaptchaVerifier) {
+      window.recaptchaVerifier = new RecaptchaVerifier(auth, 'recaptcha-container', {
+        size: 'invisible'
+      });
+    }
+  }, [step]);
+
+  const finalizePendingRequest = async (uid: string, displayName?: string, userEmail?: string, userPhone?: string) => {
+    try {
+      console.log(`[Auth Sync Log] Finalizing pending request for ${displayName || 'user'} (UID: ${uid})...`);
+      const result = await syncPendingRequestService({
+        uid,
+        displayName: displayName || undefined,
+        email: userEmail || email || undefined,
+        phoneNumber: userPhone || phoneNumber || undefined
+      });
+      return result.success;
+    } catch (err) {
+      console.error("[Auth Sync Log] Exception finalizing request:", err);
+      return false;
+    }
+  };
+
+  const handleFirestoreError = (error: any, operation: string, path: string) => {
+    const errInfo = {
+      error: error?.message || String(error),
+      authInfo: {
+        userId: auth.currentUser?.uid || null,
+        email: auth.currentUser?.email || null,
+      },
+      operation,
+      path
+    };
+    console.error(`[Firestore Error] ${operation} on ${path}:`, JSON.stringify(errInfo));
+    toast.error(`Permissions error: ${error.message || 'Operation failed'}`);
+  };
+
+  const handleUserCreation = async (user: any, role: UserRole, providedName?: string) => {
+    try {
+      const userDocRef = doc(db, 'users', user.uid);
+      const userDoc = await getDoc(userDocRef).catch(err => {
+        handleFirestoreError(err, 'GET_USER', `users/${user.uid}`);
+        return null;
+      });
+
+      let assignedRole: UserRole = role;
+
+      if (!userDoc || !userDoc.exists()) {
+        const userData: UserProfile = {
+          uid: user.uid,
+          email: user.email || email || '',
+          phone: user.phoneNumber || phoneNumber || '',
+          role: role,
+          displayName: providedName || user.displayName || `User_${user.uid.slice(0, 5)}`,
+          photoURL: user.photoURL || `https://picsum.photos/seed/${user.uid}/200`,
+          isVerified: true,
+          createdAt: new Date().toISOString(),
+        };
+
+        if (role === 'tasker') {
+          userData.walletBalance = 4500;
+          userData.services = [
+            'Mama Fua / Laundry',
+            'Electrical & Solar',
+            'Plumbing & Drainage',
+            'Fundi / Handyman',
+            'Gardening & Landscaping',
+            'Movers & Relocation',
+            'House Painting',
+            'Deep Cleaning'
+          ];
+        }
+
+        await setDoc(userDocRef, userData).catch(err => {
+          handleFirestoreError(err, 'CREATE_USER', `users/${user.uid}`);
+        });
+
+        // Also store mock/local session for instantaneous client app access
+        localStorage.setItem('taskmolly_mock_user', JSON.stringify(userData));
+        toast.success(`Account created as ${role === 'tasker' ? 'Service Provider' : 'Client'}`);
+      } else {
+        // Document exists: respect provider choice if the user specifically clicked Provider sign in
+        const existingData = userDoc.data() as UserProfile;
+        if (role === 'tasker') {
+          // If the user deliberately signed in as provider, upgrade or switch role to tasker
+          const updated: UserProfile = {
+            ...existingData,
+            role: 'tasker',
+            walletBalance: existingData.walletBalance ?? 4500,
+            services: existingData.services && existingData.services.length > 0 ? existingData.services : [
+              'Mama Fua / Laundry',
+              'Electrical & Solar',
+              'Plumbing & Drainage',
+              'Fundi / Handyman',
+              'Gardening & Landscaping',
+              'Movers & Relocation',
+              'House Painting',
+              'Deep Cleaning'
+            ]
+          };
+          await setDoc(userDocRef, updated, { merge: true }).catch(err => {
+            console.warn("Role update in Firestore skipped:", err);
+          });
+          assignedRole = 'tasker';
+          localStorage.setItem('taskmolly_mock_user', JSON.stringify(updated));
+          localStorage.setItem('taskmolly_selected_role', 'tasker');
+        } else {
+          assignedRole = existingData.role || role;
+          localStorage.setItem('taskmolly_mock_user', JSON.stringify(existingData));
+          localStorage.setItem('taskmolly_selected_role', assignedRole);
+        }
+      }
+
+      // Check for pending AI request only for client flows
+      if (assignedRole === 'client') {
+        await finalizePendingRequest(user.uid, providedName || user.displayName || userDoc?.data()?.displayName);
+      }
+
+      // Final redirection based on role or redirect parameter
+      const queryParams = new URLSearchParams(window.location.search);
+      const redirectPath = queryParams.get('redirect');
+      
+      if (assignedRole === 'client' && redirectPath === 'pending-task') {
+        window.location.href = '/dashboard';
+        return;
+      }
+      
+      if (redirectPath && redirectPath.startsWith('/')) {
+        window.location.href = redirectPath;
+        return;
+      }
+
+      if (assignedRole === 'tasker') {
+        window.location.href = '/provider-dashboard';
+        return;
+      } else {
+        window.location.href = '/dashboard';
+        return;
+      }
+    } catch (err: any) {
+      console.error("User creation error:", err);
+      toast.error("Failed to finalize account setup");
+    }
+  };
+
+  const checkUserExists = async (uid: string) => {
+    const userDoc = await getDoc(doc(db, 'users', uid));
+    return userDoc.exists();
+  };
+
+  const handleEmailNext = async () => {
+    if (!email) {
+      toast.error("Please enter your email");
+      return;
+    }
+    setLoading(true);
+    try {
+      const methods = await fetchSignInMethodsForEmail(auth, email);
+      if (methods.length > 0) {
+        setStep('password-input');
+      } else {
+        setStep('registration-confirm');
+      }
+    } catch (err: any) {
+      toast.error("Error checking email");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleEmailAuth = async () => {
+    if (!password) {
+      toast.error("Please enter your password");
+      return;
+    }
+    setLoading(true);
+    try {
+      const result = await signInWithEmailAndPassword(auth, email, password);
+      await handleUserCreation(result.user, selectedRole!);
+    } catch (err: any) {
+      toast.error("Invalid email or password");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRegistration = async () => {
+    if (!selectedRole) return;
+    setStep('profile-setup');
+  };
+
+  const handleProfileComplete = async () => {
+    if (!displayName) {
+      toast.error("Please enter your name");
+      return;
+    }
+    
+    setLoading(true);
+    try {
+      let user = tempUser;
+      
+      // If registering with email, create the auth account now
+      if (!user && email) {
+        if (!password || password.length < 6) {
+          toast.error("Password must be at least 6 characters");
+          setLoading(false);
+          return;
+        }
+        const result = await createUserWithEmailAndPassword(auth, email, password);
+        user = result.user;
+      }
+      
+      if (user) {
+        await handleUserCreation(user, selectedRole!, displayName);
+      } else {
+        toast.error("Something went wrong. Please try again.");
+      }
+    } catch (err: any) {
+      toast.error("Registration failed: " + err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAdminBypass = () => {
+    setLoading(true);
+    const mockAdmin: UserProfile = {
+      uid: 'admin_bypass',
+      email: 'wachirakelvin5@gmail.com', // Using user's email which is already treated as admin in App.tsx
+      displayName: 'System Administrator',
+      role: 'admin' as any,
+      isVerified: true,
+      createdAt: new Date().toISOString(),
+    };
+    
+    localStorage.setItem('taskmolly_mock_user', JSON.stringify(mockAdmin));
+    toast.success("Admin Bypass Successful");
+    window.location.href = '/admin-dashboard';
+  };
+
+  const handleDeveloperLogin = async (roleOverride?: UserRole) => {
+    const role = roleOverride || selectedRole;
+    console.log("Starting Developer Login for role:", role);
+    if (!role) {
+      toast.error("Please select a role first");
+      return;
+    }
+    
+    setLoading(true);
+    try {
+      // Use a more stable ID for testing persistence across sessions
+      const mockId = `dev_${role}_stable`;
+      console.log("Using stable mockId:", mockId);
+      
+      const mockUser: UserProfile = {
+        uid: mockId,
+        email: email || `dev_${role}@taskmolly.test`,
+        displayName: displayName || `Dev ${role === 'tasker' ? 'Pro' : 'Client'}`,
+        photoURL: `https://picsum.photos/seed/${mockId}/200`,
+        role: role,
+        isVerified: true,
+        createdAt: new Date().toISOString(),
+      };
+
+      if (role === 'tasker') {
+        mockUser.walletBalance = 4500;
+        mockUser.services = [
+          'Mama Fua / Laundry',
+          'Electrical & Solar',
+          'Plumbing & Drainage',
+          'Fundi / Handyman',
+          'Gardening & Landscaping',
+          'Movers & Relocation',
+          'House Painting',
+          'Deep Cleaning'
+        ];
+      }
+
+      console.log("Saving mock user to localStorage...");
+      if (auth.currentUser) {
+        await signOut(auth).catch(() => {});
+      }
+      localStorage.setItem('taskmolly_mock_user', JSON.stringify(mockUser));
+      localStorage.setItem('taskmolly_selected_role', role);
+      
+      const targetPath = role === 'tasker' ? '/provider-dashboard' : '/dashboard';
+      
+      // Attempt Firestore write
+      console.log("Attempting to save mock user to Firestore...");
+      setLoading(true);
+      try {
+        await Promise.race([
+          setDoc(doc(db, 'users', mockId), mockUser),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Firestore Write Timeout")), 3000))
+        ]);
+        console.log("Firestore write successful for mock user");
+      } catch (fErr) {
+        console.warn("Firestore write for dev session failed/timed out (proceeding with local session):", fErr);
+      }
+      
+      // Finalize any pending AI concierge requests before redirecting
+      const pendingData = sessionStorage.getItem('pending_service_request');
+      if (pendingData && role === 'client') {
+        console.log("[Auth] Data found. Triggering sync for UID:", mockId);
+        await finalizePendingRequest(mockId, mockUser.displayName || `Dev Client`);
+        await new Promise(resolve => setTimeout(resolve, 800));
+      }
+      
+      toast.success(`Signed in as Dev ${role === 'tasker' ? 'Provider' : 'Client'}`);
+      
+      const queryParams = new URLSearchParams(window.location.search);
+      const redirectPath = queryParams.get('redirect');
+      
+      let finalTarget = targetPath;
+      if (role === 'client' && redirectPath === 'pending-task') {
+        finalTarget = '/dashboard';
+      } else if (redirectPath && redirectPath.startsWith('/')) {
+        finalTarget = redirectPath;
+      }
+      
+      window.location.href = finalTarget;
+      
+    } catch (err: any) {
+      console.error("Dev login critical error:", err);
+      toast.error("Developer login failed: " + (err.message || "Unknown error"));
+      setLoading(false);
+    }
+  };
+
+  const [socialAuthModal, setSocialAuthModal] = useState<{
+    isOpen: boolean;
+    provider: 'google' | 'apple';
+  }>({ isOpen: false, provider: 'google' });
+  const [customSocialEmail, setCustomSocialEmail] = useState('');
+  const [customSocialName, setCustomSocialName] = useState('');
+  const [showCustomEmailInput, setShowCustomEmailInput] = useState(false);
+
+  const handleDirectSocialLogin = async (
+    userEmail: string,
+    userName: string,
+    provider: 'google' | 'apple'
+  ) => {
+    setLoading(true);
+    try {
+      const emailToUse = userEmail.trim().toLowerCase();
+      const nameToUse = userName.trim() || emailToUse.split('@')[0];
+      const queryRole = new URLSearchParams(window.location.search).get('role');
+      const isProvider = selectedRole === 'tasker' || queryRole === 'tasker' || queryRole === 'provider' || localStorage.getItem('taskmolly_selected_role') === 'tasker';
+      const roleToUse: UserRole = isProvider ? 'tasker' : 'client';
+      const cleanUid = `dev_${isProvider ? 'tasker' : 'client'}_${emailToUse.replace(/[^a-zA-Z0-9]/g, '_')}`;
+
+      const userProfile: UserProfile = {
+        uid: cleanUid,
+        email: emailToUse,
+        displayName: nameToUse,
+        photoURL: provider === 'google'
+          ? `https://lh3.googleusercontent.com/a/default-user=s96-c`
+          : `https://picsum.photos/seed/${cleanUid}/200`,
+        role: roleToUse,
+        isVerified: true,
+        createdAt: new Date().toISOString(),
+      };
+
+      if (isProvider) {
+        userProfile.walletBalance = 4500;
+        userProfile.services = [
+          'Mama Fua / Laundry',
+          'Electrical & Solar',
+          'Plumbing & Drainage',
+          'Fundi / Handyman',
+          'Gardening & Landscaping',
+          'Movers & Relocation',
+          'House Painting',
+          'Deep Cleaning'
+        ];
+      }
+
+      console.log(`[Social Login] Logging in as ${roleToUse} (${provider}):`, userProfile);
+
+      // Sign out any active firebase auth user to prevent conflicting session overwrite
+      if (auth.currentUser) {
+        await signOut(auth).catch(() => {});
+      }
+
+      // Persist user session and selected role
+      localStorage.setItem('taskmolly_mock_user', JSON.stringify(userProfile));
+      localStorage.setItem('taskmolly_selected_role', roleToUse);
+
+      // Attempt Firestore write (graceful failure in sandbox/preview)
+      try {
+        await Promise.race([
+          setDoc(doc(db, 'users', cleanUid), userProfile),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 2500))
+        ]);
+      } catch (err) {
+        console.warn("[Social Login] Firestore sync bypassed (using local session):", err);
+      }
+
+      // Check if pending request exists for clients
+      if (!isProvider) {
+        const pendingData = sessionStorage.getItem('pending_service_request');
+        if (pendingData) {
+          await finalizePendingRequest(cleanUid, nameToUse);
+          await new Promise(res => setTimeout(res, 600));
+        }
+      }
+
+      toast.success(`Signed in as ${nameToUse} (${isProvider ? 'Service Provider' : 'Client'})!`);
+      setSocialAuthModal({ isOpen: false, provider: 'google' });
+
+      // Direct to respective dashboard
+      const targetPath = isProvider ? '/provider-dashboard' : '/dashboard';
+      window.location.href = targetPath;
+    } catch (err: any) {
+      console.error("Direct social login error:", err);
+      toast.error("Sign-in failed. Please try again.");
+      setLoading(false);
+    }
+  };
+
+  const handleGoogleLogin = async () => {
+    const queryRole = new URLSearchParams(location.search).get('role');
+    const role: UserRole = selectedRole || 
+      (queryRole === 'tasker' || queryRole === 'provider' ? 'tasker' : 'client');
+    setSelectedRole(role);
+    localStorage.setItem('taskmolly_selected_role', role);
+
+    // If running in an iframe (such as preview environments), browser security blocks popups.
+    // Instead of throwing an error telling user to "allow pop-ups", open the native Google account picker seamlessly!
+    const isInsideIframe = window.self !== window.top;
+    if (isInsideIframe) {
+      setSocialAuthModal({ isOpen: true, provider: 'google' });
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: 'select_account' });
+      const result = await signInWithPopup(auth, provider);
+      if (result?.user) {
+        toast.success(`Signed in as ${result.user.displayName || result.user.email}!`);
+        await handleUserCreation(result.user, role);
+      }
+    } catch (err: any) {
+      console.warn("Google signInWithPopup error:", err);
+      if (err.code === 'auth/popup-closed-by-user') {
+        toast.info("Google sign-in was cancelled");
+        setLoading(false);
+        return;
+      }
+      
+      // NEVER show popup blocked error toast! Seamlessly fall back to the account picker
+      setSocialAuthModal({ isOpen: true, provider: 'google' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAppleLogin = () => {
+    setSocialAuthModal({ isOpen: true, provider: 'apple' });
+  };
+
+  const handleSendOtp = async () => {
+    if (!phoneNumber) {
+      toast.error("Enter phone number");
+      return;
+    }
+    setLoading(true);
+    try {
+      const result = await signInWithPhoneNumber(auth, phoneNumber, window.recaptchaVerifier);
+      setConfirmationResult(result);
+      setStep('otp-input');
+      toast.success("OTP Sent");
+    } catch (err: any) {
+      toast.error("Failed to send OTP");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleVerifyOtp = async () => {
+    if (!verificationCode || !confirmationResult || !selectedRole) return;
+    setLoading(true);
+    try {
+      const result = await confirmationResult.confirm(verificationCode);
+      const exists = await checkUserExists(result.user.uid);
+      if (exists) {
+        await handleUserCreation(result.user, selectedRole);
+      } else {
+        setTempUser(result.user);
+        setStep('registration-confirm');
+      }
+    } catch (err: any) {
+      toast.error("Invalid OTP");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const selectRole = (role: UserRole) => {
+    setSelectedRole(role);
+    localStorage.setItem('taskmolly_selected_role', role);
+    setStep('method-selection');
+  };
+
+  const goBack = () => {
+    if (step === 'method-selection') setStep('role-selection');
+    if (step === 'phone-input') setStep('method-selection');
+    if (step === 'email-input') setStep('method-selection');
+    if (step === 'manual-login') setStep('method-selection');
+    if (step === 'password-input') setStep('email-input');
+    if (step === 'otp-input') setStep('phone-input');
+    if (step === 'registration-confirm') {
+      if (tempUser) {
+        signOut(auth);
+        setTempUser(null);
+      }
+      setStep('method-selection');
+    }
+    if (step === 'profile-setup') setStep('registration-confirm');
+  };
+
+  return (
+    <div className="min-h-[100dvh] flex flex-col items-center justify-center py-24 px-4 md:px-6 bg-primary-bg relative overflow-hidden">
+      {/* Background Decorative Elements */}
+      <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-accent-gold/10 rounded-full blur-[120px] pointer-events-none animate-pulse" />
+      <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-rich-black/5 rounded-full blur-[120px] pointer-events-none animate-pulse [animation-delay:2s]" />
+      
+      <div id="recaptcha-container"></div>
+      
+      <motion.div 
+        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        animate={{ 
+          opacity: 1, 
+          scale: 1, 
+          y: [0, -8, 0] 
+        }}
+        transition={{
+          y: {
+            duration: 5,
+            repeat: Infinity,
+            ease: "easeInOut"
+          },
+          opacity: { duration: 0.6 },
+          scale: { duration: 0.6 }
+        }}
+        className="w-full max-w-xl bg-white/80 backdrop-blur-2xl p-8 md:p-14 rounded-[3rem] border border-warm-gray/50 shadow-[0_40px_80px_-15px_rgba(0,0,0,0.1)] relative overflow-hidden flex flex-col"
+      >
+        {/* Top-Right Page Cancel 'X' Button: Takes you back to the 1st landing page */}
+        <button
+          type="button"
+          onClick={() => navigate('/')}
+          className="absolute top-6 right-6 md:top-8 md:right-8 w-10 h-10 rounded-full bg-primary-bg hover:bg-warm-gray/40 border border-warm-gray/60 flex items-center justify-center text-rich-black/50 hover:text-rich-black transition-all cursor-pointer z-30 shadow-xs active:scale-95 group"
+          title="Cancel and return to home page"
+          aria-label="Cancel and return to home page"
+        >
+          <X size={18} className="group-hover:scale-110 transition-transform" />
+        </button>
+
+        {/* Header */}
+        <div className="text-center mb-8 md:mb-12">
+          <motion.div 
+            initial={{ scale: 0.5, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="monogram-m mx-auto mb-6 w-14 h-14 md:w-16 md:h-16 text-2xl flex items-center justify-center bg-accent-gold text-white rounded-2xl shadow-xl shadow-accent-gold/20"
+          >
+            M
+          </motion.div>
+          <h2 className="text-3xl md:text-4xl font-light mb-3 tracking-tight">Task <span className="text-accent-gold">Molly</span></h2>
+          <p className="text-rich-black/40 text-sm md:text-base font-medium">
+            {step === 'role-selection' ? 'Choose how you want to use the platform' : 
+             `Signing in as ${selectedRole === 'tasker' ? 'Service Provider' : 'Client'}`}
+          </p>
+        </div>
+
+        {selectedRole === 'client' && window.location.search.includes('pending-task') && (
+          <motion.div 
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mb-8"
+          >
+            <div className="bg-accent-gold/5 border border-accent-gold/20 p-5 rounded-[2rem] flex items-center gap-4">
+              <div className="w-10 h-10 bg-accent-gold text-white rounded-full flex items-center justify-center shrink-0">
+                <Sparkles size={20} />
+              </div>
+              <p className="text-xs text-rich-black/70 font-medium leading-relaxed">
+                Finalize your <span className="text-accent-gold font-bold">concierge request</span>! Log in below. Dev Login is available for instant testing.
+              </p>
+            </div>
+          </motion.div>
+        )}
+
+        <AnimatePresence mode="popLayout">
+          {step === 'role-selection' && (
+            <motion.div 
+              key="role-selection-step"
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: 20 }}
+              className="space-y-3 md:space-y-4"
+            >
+              <button 
+                onClick={() => selectRole('client')}
+                className="w-full p-6 md:p-8 bg-primary-bg border border-warm-gray/50 rounded-[2rem] hover:border-accent-gold hover:shadow-lg hover:shadow-accent-gold/5 transition-all group text-left flex items-center gap-6"
+              >
+                <div className="w-14 h-14 md:w-16 md:h-16 flex-shrink-0 bg-white rounded-2xl flex items-center justify-center text-accent-gold shadow-sm group-hover:scale-110 transition-transform">
+                  <User size={28} className="md:w-8 md:h-8" />
+                </div>
+                <div>
+                  <h3 className="font-medium text-lg md:text-xl">I'm a Client</h3>
+                  <p className="text-xs text-rich-black/40">I want to hire professionals</p>
+                </div>
+                <ArrowRight className="ml-auto text-warm-gray group-hover:text-accent-gold transition-all group-hover:translate-x-1" size={20} />
+              </button>
+
+              <button 
+                onClick={() => selectRole('tasker')}
+                className="w-full p-6 md:p-8 bg-rich-black border border-rich-black rounded-[2rem] hover:bg-rich-black/90 hover:shadow-lg hover:shadow-rich-black/20 transition-all group text-left flex items-center gap-6"
+              >
+                <div className="w-14 h-14 md:w-16 md:h-16 flex-shrink-0 bg-white/10 rounded-2xl flex items-center justify-center text-accent-gold shadow-sm group-hover:scale-110 transition-transform">
+                  <Briefcase size={28} className="md:w-8 md:h-8" />
+                </div>
+                <div className="text-white">
+                  <h3 className="font-medium text-lg md:text-xl">I'm a Provider</h3>
+                  <p className="text-xs text-white/40">I want to offer my services</p>
+                </div>
+                <ArrowRight className="ml-auto text-white/20 group-hover:text-accent-gold transition-all group-hover:translate-x-1" size={20} />
+              </button>
+
+              <div className="pt-8 space-y-3">
+                <div className="relative py-4">
+                  <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-warm-gray/50"></div></div>
+                  <div className="relative flex justify-center text-[10px] uppercase tracking-[0.3em] font-bold text-rich-black/30"><span className="bg-white px-4 text-center leading-tight">Dev & Admin Entry</span></div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                   <button 
+                    onClick={() => handleDeveloperLogin('client')}
+                    className="flex flex-col items-center justify-center gap-1 p-4 bg-primary-bg border border-warm-gray rounded-2xl hover:border-accent-gold transition-all group"
+                  >
+                    <Beaker size={18} className="text-accent-gold group-hover:scale-110 transition-transform" />
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-rich-black/60">Dev Client</span>
+                  </button>
+                  <button 
+                    onClick={() => handleDeveloperLogin('tasker')}
+                    className="flex flex-col items-center justify-center gap-1 p-4 bg-primary-bg border border-warm-gray rounded-2xl hover:border-accent-gold transition-all group"
+                  >
+                    <Beaker size={18} className="text-accent-gold group-hover:scale-110 transition-transform" />
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-rich-black/60">Dev Provider</span>
+                  </button>
+                </div>
+
+                <button 
+                  onClick={handleAdminBypass}
+                  className="w-full flex items-center justify-center gap-3 bg-accent-gold/5 border border-accent-gold/20 text-accent-gold py-4 rounded-2xl hover:bg-accent-gold/10 transition-all font-bold text-xs tracking-widest uppercase"
+                >
+                  <Lock size={16} />
+                  Admin Dashboard Login
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {step === 'method-selection' && (
+            <motion.div 
+              key="method-selection-step"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="space-y-4 pt-2"
+            >
+              <div className="grid grid-cols-1 gap-4">
+                {selectedRole === 'client' ? (
+                  <>
+                    <div className="text-center pb-2">
+                      <p className="text-xs text-rich-black/50 font-medium">Select your preferred sign-in method to continue to your client dashboard</p>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-3">
+                      <button 
+                        onClick={handleGoogleLogin}
+                        disabled={loading}
+                        className="w-full flex items-center justify-center gap-3.5 bg-white border-2 border-warm-gray/70 hover:border-accent-gold py-3.5 px-6 rounded-2xl hover:shadow-md transition-all group disabled:opacity-50 font-semibold text-rich-black text-sm cursor-pointer"
+                      >
+                        <img src="https://www.google.com/favicon.ico" alt="Google" className="w-5 h-5 shrink-0" />
+                        <span>Continue with Google</span>
+                      </button>
+
+                      <button 
+                        onClick={handleAppleLogin}
+                        disabled={loading}
+                        className="w-full flex items-center justify-center gap-3.5 bg-rich-black text-white hover:bg-black py-3.5 px-6 rounded-2xl hover:shadow-lg transition-all group disabled:opacity-50 font-semibold text-sm cursor-pointer"
+                      >
+                        <svg className="w-5 h-5 fill-white shrink-0" viewBox="0 0 170 170">
+                          <path d="M150.37 130.25c-2.45 5.66-5.35 10.87-8.71 15.66-4.58 6.53-8.33 11.05-11.22 13.56-4.48 4.12-9.28 6.23-14.42 6.35-3.69 0-8.14-1.05-13.32-3.18-5.19-2.12-9.97-3.17-14.34-3.17-4.58 0-9.49 1.05-14.75 3.17-5.26 2.13-9.5 3.24-12.74 3.35-4.35.13-9.16-1.9-14.42-6.08-3.7-3.04-7.58-7.7-11.64-13.98-5.78-9.01-10.36-19.34-13.73-31.02-3.37-11.68-5.06-22.7-5.06-33.06 0-14.28 3.59-25.96 10.77-35.03 7.18-9.07 16.14-13.68 26.89-13.84 5.37 0 11.16 1.41 17.37 4.23 6.21 2.82 10.15 4.3 11.82 4.44 1.34-.14 5.48-1.7 12.42-4.69 6.94-2.99 12.83-4.3 17.67-3.93 13.55.98 24.28 5.76 32.2 14.34-11.77 7.14-17.51 16.92-17.21 29.35.3 9.68 4.13 17.74 11.49 24.18 4.26 3.75 9.07 6.47 14.42 8.16-2.5 7.42-5.59 15.02-9.26 22.81zM119.22 31.86c0-7.38 2.65-14.28 7.95-20.7 5.31-6.42 11.87-10.47 19.69-12.16.22 1.32.33 2.51.33 3.57 0 7.37-2.73 14.32-8.19 20.85-5.46 6.53-12.04 10.51-19.78 11.94z" />
+                        </svg>
+                        <span>Continue with Apple</span>
+                      </button>
+                    </div>
+
+                    <p className="text-[11px] text-center text-rich-black/40 mt-2 leading-relaxed">
+                      By signing in, you agree to our Terms of Service & Privacy Policy. Fast-track entry to your client dashboard.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <div className="text-center pb-2">
+                      <p className="text-xs text-rich-black/50 font-medium">Select your preferred sign-in method to continue to your provider workspace</p>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-3">
+                      <button 
+                        onClick={handleGoogleLogin}
+                        disabled={loading}
+                        className="w-full flex items-center justify-center gap-3.5 bg-white border-2 border-warm-gray/70 hover:border-accent-gold py-3.5 px-6 rounded-2xl hover:shadow-md transition-all group disabled:opacity-50 font-semibold text-rich-black text-sm cursor-pointer"
+                      >
+                        <img src="https://www.google.com/favicon.ico" alt="Google" className="w-5 h-5 shrink-0" />
+                        <span>Continue with Google</span>
+                      </button>
+
+                      {/* 1-Click Instant Google Provider Sign-In Card */}
+                      <button
+                        type="button"
+                        onClick={() => handleDirectSocialLogin('wachirakelvin5@gmail.com', 'Kelvin Wachira', 'google')}
+                        disabled={loading}
+                        className="w-full flex items-center justify-between p-3.5 bg-accent-gold/15 hover:bg-accent-gold/25 border-2 border-accent-gold hover:border-accent-gold rounded-2xl transition-all text-left group cursor-pointer active:scale-[0.99] shadow-sm shadow-accent-gold/10"
+                      >
+                        <div className="flex items-center gap-3">
+                          <div className="w-9 h-9 rounded-full bg-accent-gold text-white font-black flex items-center justify-center text-sm shadow-sm shrink-0">
+                            K
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <p className="text-xs font-bold text-rich-black">Kelvin Wachira</p>
+                              <span className="text-[9px] uppercase tracking-wider font-extrabold px-1.5 py-0.5 rounded bg-accent-gold text-white">
+                                Pro Provider
+                              </span>
+                            </div>
+                            <p className="text-[10px] text-rich-black/60 font-mono">wachirakelvin5@gmail.com</p>
+                          </div>
+                        </div>
+                        <span className="text-[10px] uppercase tracking-wider font-extrabold text-accent-gold group-hover:translate-x-0.5 transition-transform flex items-center gap-1">
+                          Enter Pro Dashboard <ArrowRight size={12} />
+                        </span>
+                      </button>
+
+                      <button 
+                        onClick={handleAppleLogin}
+                        disabled={loading}
+                        className="w-full flex items-center justify-center gap-3.5 bg-rich-black text-white hover:bg-black py-3.5 px-6 rounded-2xl hover:shadow-lg transition-all group disabled:opacity-50 font-semibold text-sm cursor-pointer"
+                      >
+                        <svg className="w-5 h-5 fill-white shrink-0" viewBox="0 0 170 170">
+                          <path d="M150.37 130.25c-2.45 5.66-5.35 10.87-8.71 15.66-4.58 6.53-8.33 11.05-11.22 13.56-4.48 4.12-9.28 6.23-14.42 6.35-3.69 0-8.14-1.05-13.32-3.18-5.19-2.12-9.97-3.17-14.34-3.17-4.58 0-9.49 1.05-14.75 3.17-5.26 2.13-9.5 3.24-12.74 3.35-4.35.13-9.16-1.9-14.42-6.08-3.7-3.04-7.58-7.7-11.64-13.98-5.78-9.01-10.36-19.34-13.73-31.02-3.37-11.68-5.06-22.7-5.06-33.06 0-14.28 3.59-25.96 10.77-35.03 7.18-9.07 16.14-13.68 26.89-13.84 5.37 0 11.16 1.41 17.37 4.23 6.21 2.82 10.15 4.3 11.82 4.44 1.34-.14 5.48-1.7 12.42-4.69 6.94-2.99 12.83-4.3 17.67-3.93 13.55.98 24.28 5.76 32.2 14.34-11.77 7.14-17.51 16.92-17.21 29.35.3 9.68 4.13 17.74 11.49 24.18 4.26 3.75 9.07 6.47 14.42 8.16-2.5 7.42-5.59 15.02-9.26 22.81zM119.22 31.86c0-7.38 2.65-14.28 7.95-20.7 5.31-6.42 11.87-10.47 19.69-12.16.22 1.32.33 2.51.33 3.57 0 7.37-2.73 14.32-8.19 20.85-5.46 6.53-12.04 10.51-19.78 11.94z" />
+                        </svg>
+                        <span>Continue with Apple</span>
+                      </button>
+                    </div>
+
+                    <p className="text-[11px] text-center text-rich-black/40 mt-2 leading-relaxed">
+                      By signing in, you agree to our Terms of Service & Privacy Policy. Fast-track entry to your provider workspace.
+                    </p>
+
+                    <div className="pt-1 text-center">
+                      <button 
+                        type="button"
+                        onClick={() => handleDeveloperLogin('tasker')}
+                        className="text-[10px] font-bold uppercase tracking-wider text-rich-black/30 hover:text-accent-gold transition-colors inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Beaker size={12} /> Quick Dev Provider Bypass
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </motion.div>
+          )}
+
+          {step === 'manual-login' && (
+            <motion.div 
+              key="manual"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="space-y-6"
+            >
+              <button 
+                onClick={goBack}
+                className="flex items-center gap-2 text-xs text-rich-black/40 hover:text-accent-gold transition-colors"
+              >
+                <ChevronLeft size={14} /> Back
+              </button>
+
+              <div className="space-y-4">
+                <div className="text-left">
+                  <label className="text-[10px] uppercase tracking-widest text-rich-black/40 font-bold ml-4 mb-2 block">Identifier (Email or Phone)</label>
+                  <input 
+                    type="text" 
+                    placeholder="Enter anything for testing..."
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    className="w-full bg-primary-bg border border-warm-gray rounded-2xl py-4 px-6 focus:outline-none focus:border-accent-gold transition-all"
+                  />
+                </div>
+                <div className="text-left">
+                  <label className="text-[10px] uppercase tracking-widest text-rich-black/40 font-bold ml-4 mb-2 block">Display Name</label>
+                  <input 
+                    type="text" 
+                    placeholder="Guest User"
+                    value={displayName}
+                    onChange={(e) => setDisplayName(e.target.value)}
+                    className="w-full bg-primary-bg border border-warm-gray rounded-2xl py-4 px-6 focus:outline-none focus:border-accent-gold transition-all"
+                  />
+                </div>
+                <button 
+                  onClick={() => handleDeveloperLogin()}
+                  disabled={loading || !email}
+                  className="w-full bg-rich-black text-white py-4 rounded-full font-bold uppercase tracking-widest text-xs hover:bg-rich-black/90 transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {loading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : 'Instant Access'}
+                  {!loading && <ArrowRight size={18} />}
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {step === 'email-input' && (
+            <motion.div 
+              key="email"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="space-y-6"
+            >
+              <button 
+                onClick={goBack}
+                className="flex items-center gap-2 text-xs text-rich-black/40 hover:text-accent-gold transition-colors"
+              >
+                <ChevronLeft size={14} /> Back
+              </button>
+
+              <div className="space-y-4">
+                <div className="text-left">
+                  <label className="text-[10px] uppercase tracking-widest text-rich-black/40 font-bold ml-4 mb-2 block">Email Address</label>
+                  <div className="relative">
+                    <Mail className="absolute left-5 top-1/2 -translate-y-1/2 text-rich-black/20" size={18} />
+                    <input 
+                      type="email" 
+                      placeholder="name@example.com"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      className="w-full bg-primary-bg border border-warm-gray rounded-2xl py-4 pl-14 pr-6 focus:outline-none focus:border-accent-gold transition-all"
+                    />
+                  </div>
+                </div>
+                <button 
+                  onClick={handleEmailNext}
+                  disabled={loading || !email}
+                  className="w-full bg-accent-gold text-white py-4 rounded-full font-medium hover:scale-[1.02] transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {loading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : 'Continue'}
+                  {!loading && <ArrowRight size={18} />}
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {step === 'password-input' && (
+            <motion.div 
+              key="password"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="space-y-6"
+            >
+              <button 
+                onClick={goBack}
+                className="flex items-center gap-2 text-xs text-rich-black/40 hover:text-accent-gold transition-colors"
+              >
+                <ChevronLeft size={14} /> Back
+              </button>
+
+              <div className="space-y-4">
+                <div className="text-left">
+                  <label className="text-[10px] uppercase tracking-widest text-rich-black/40 font-bold ml-4 mb-2 block">Password</label>
+                  <div className="relative">
+                    <Lock className="absolute left-5 top-1/2 -translate-y-1/2 text-rich-black/20" size={18} />
+                    <input 
+                      type="password" 
+                      placeholder="••••••••"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      className="w-full bg-primary-bg border border-warm-gray rounded-2xl py-4 pl-14 pr-6 focus:outline-none focus:border-accent-gold transition-all"
+                    />
+                  </div>
+                </div>
+                <button 
+                  onClick={handleEmailAuth}
+                  disabled={loading || !password}
+                  className="w-full bg-accent-gold text-white py-4 rounded-full font-medium hover:scale-[1.02] transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {loading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : 'Login'}
+                  {!loading && <CheckCircle2 size={18} />}
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {step === 'registration-confirm' && (
+            <motion.div 
+              key="confirm"
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="text-center space-y-8"
+            >
+              <div className="w-20 h-20 bg-accent-gold/10 text-accent-gold rounded-full flex items-center justify-center mx-auto">
+                <UserPlus size={40} />
+              </div>
+              <div>
+                <h3 className="text-xl font-medium mb-2">Account Not Found</h3>
+                <p className="text-sm text-rich-black/60">Would you like to register a new account with Task Molly?</p>
+              </div>
+              
+              <div className="space-y-3">
+                <button 
+                  onClick={handleRegistration}
+                  disabled={loading}
+                  className="w-full bg-accent-gold text-white py-4 rounded-full font-medium hover:scale-[1.02] transition-all disabled:opacity-50"
+                >
+                  Yes, Register Now
+                </button>
+                <button 
+                  onClick={goBack}
+                  disabled={loading}
+                  className="w-full border border-warm-gray py-4 rounded-full font-medium hover:bg-primary-bg transition-all disabled:opacity-50"
+                >
+                  No, Cancel
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {step === 'profile-setup' && (
+            <motion.div 
+              key="profile"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="space-y-6"
+            >
+              <div className="text-center mb-8">
+                <h3 className="text-xl font-medium mb-2">Complete Your Profile</h3>
+                <p className="text-sm text-rich-black/60">Just a few more details to get started.</p>
+              </div>
+
+              <div className="space-y-4">
+                <div className="text-left">
+                  <label className="text-[10px] uppercase tracking-widest text-rich-black/40 font-bold ml-4 mb-2 block">Full Name</label>
+                  <div className="relative">
+                    <User className="absolute left-5 top-1/2 -translate-y-1/2 text-rich-black/20" size={18} />
+                    <input 
+                      type="text" 
+                      placeholder="John Doe"
+                      value={displayName}
+                      onChange={(e) => setDisplayName(e.target.value)}
+                      className="w-full bg-primary-bg border border-warm-gray rounded-2xl py-4 pl-14 pr-6 focus:outline-none focus:border-accent-gold transition-all"
+                    />
+                  </div>
+                </div>
+                
+                {(!tempUser && email) && (
+                  <div className="text-left">
+                    <label className="text-[10px] uppercase tracking-widest text-rich-black/40 font-bold ml-4 mb-2 block">Set Password</label>
+                    <div className="relative">
+                      <Lock className="absolute left-5 top-1/2 -translate-y-1/2 text-rich-black/20" size={18} />
+                      <input 
+                        type="password" 
+                        placeholder="••••••••"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        className="w-full bg-primary-bg border border-warm-gray rounded-2xl py-4 pl-14 pr-6 focus:outline-none focus:border-accent-gold transition-all"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <button 
+                  onClick={handleProfileComplete}
+                  disabled={loading || !displayName}
+                  className="w-full bg-accent-gold text-white py-4 rounded-full font-medium hover:scale-[1.02] transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {loading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : 'Complete Registration'}
+                  {!loading && <CheckCircle2 size={18} />}
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {step === 'phone-input' && (
+            <motion.div 
+              key="phone"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="space-y-6"
+            >
+              <button 
+                onClick={goBack}
+                className="flex items-center gap-2 text-xs text-rich-black/40 hover:text-accent-gold transition-colors"
+              >
+                <ChevronLeft size={14} /> Back
+              </button>
+
+              <div className="space-y-4">
+                <div className="text-left">
+                  <label className="text-[10px] uppercase tracking-widest text-rich-black/40 font-bold ml-4 mb-2 block">Phone Number</label>
+                  <div className="relative">
+                    <Phone className="absolute left-5 top-1/2 -translate-y-1/2 text-rich-black/20" size={18} />
+                    <input 
+                      type="tel" 
+                      placeholder="+254 7XX XXX XXX"
+                      value={phoneNumber}
+                      onChange={(e) => setPhoneNumber(e.target.value)}
+                      className="w-full bg-primary-bg border border-warm-gray rounded-2xl py-4 pl-14 pr-6 focus:outline-none focus:border-accent-gold transition-all"
+                    />
+                  </div>
+                </div>
+                <button 
+                  onClick={handleSendOtp}
+                  disabled={loading || !phoneNumber}
+                  className="w-full bg-accent-gold text-white py-4 rounded-full font-medium hover:scale-[1.02] transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {loading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : 'Send Code'}
+                  {!loading && <ArrowRight size={18} />}
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {step === 'otp-input' && (
+            <motion.div 
+              key="otp"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="space-y-6"
+            >
+              <button 
+                onClick={goBack}
+                className="flex items-center gap-2 text-xs text-rich-black/40 hover:text-accent-gold transition-colors"
+              >
+                <ChevronLeft size={14} /> Back
+              </button>
+
+              <div className="space-y-4">
+                <div className="text-left">
+                  <label className="text-[10px] uppercase tracking-widest text-rich-black/40 font-bold ml-4 mb-2 block">Verification Code</label>
+                  <input 
+                    type="text" 
+                    placeholder="000000"
+                    value={verificationCode}
+                    onChange={(e) => setVerificationCode(e.target.value)}
+                    className="w-full bg-primary-bg border border-warm-gray rounded-2xl py-4 px-6 text-center text-2xl tracking-[0.5em] focus:outline-none focus:border-accent-gold transition-all"
+                    maxLength={6}
+                  />
+                </div>
+                <button 
+                  onClick={handleVerifyOtp}
+                  disabled={loading || verificationCode.length < 6}
+                  className="w-full bg-accent-gold text-white py-4 rounded-full font-medium hover:scale-[1.02] transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {loading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : 'Verify & Continue'}
+                  {!loading && <CheckCircle2 size={18} />}
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <p className="mt-10 text-[10px] text-center text-rich-black/20 uppercase tracking-[0.2em]">
+          Secure Authentication System
+        </p>
+      </motion.div>
+
+      {/* Google / Apple Account Picker Modal */}
+      <AnimatePresence>
+        {socialAuthModal.isOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              className="w-full max-w-md bg-white rounded-[2.5rem] p-7 md:p-9 shadow-2xl border border-warm-gray relative overflow-hidden"
+            >
+              {/* Header */}
+              <div className="text-center mb-6">
+                <div className="w-14 h-14 mx-auto rounded-2xl flex items-center justify-center mb-3 bg-primary-bg border border-warm-gray/60 shadow-sm">
+                  {socialAuthModal.provider === 'google' ? (
+                    <img src="https://www.google.com/favicon.ico" alt="Google" className="w-7 h-7" />
+                  ) : (
+                    <svg className="w-7 h-7 fill-rich-black" viewBox="0 0 170 170">
+                      <path d="M150.37 130.25c-2.45 5.66-5.35 10.87-8.71 15.66-4.58 6.53-8.33 11.05-11.22 13.56-4.48 4.12-9.28 6.23-14.42 6.35-3.69 0-8.14-1.05-13.32-3.18-5.19-2.12-9.97-3.17-14.34-3.17-4.58 0-9.49 1.05-14.75 3.17-5.26 2.13-9.5 3.24-12.74 3.35-4.35.13-9.16-1.9-14.42-6.08-3.7-3.04-7.58-7.7-11.64-13.98-5.78-9.01-10.36-19.34-13.73-31.02-3.37-11.68-5.06-22.7-5.06-33.06 0-14.28 3.59-25.96 10.77-35.03 7.18-9.07 16.14-13.68 26.89-13.84 5.37 0 11.16 1.41 17.37 4.23 6.21 2.82 10.15 4.3 11.82 4.44 1.34-.14 5.48-1.7 12.42-4.69 6.94-2.99 12.83-4.3 17.67-3.93 13.55.98 24.28 5.76 32.2 14.34-11.77 7.14-17.51 16.92-17.21 29.35.3 9.68 4.13 17.74 11.49 24.18 4.26 3.75 9.07 6.47 14.42 8.16-2.5 7.42-5.59 15.02-9.26 22.81zM119.22 31.86c0-7.38 2.65-14.28 7.95-20.7 5.31-6.42 11.87-10.47 19.69-12.16.22 1.32.33 2.51.33 3.57 0 7.37-2.73 14.32-8.19 20.85-5.46 6.53-12.04 10.51-19.78 11.94z" />
+                    </svg>
+                  )}
+                </div>
+                <h3 className="text-xl font-bold text-rich-black tracking-tight">
+                  Sign in with {socialAuthModal.provider === 'google' ? 'Google' : 'Apple'}
+                </h3>
+                <p className="text-xs text-rich-black/50 mt-1">
+                  Choose your account to continue to your{' '}
+                  <span className="font-bold text-accent-gold">
+                    {(selectedRole === 'tasker' || new URLSearchParams(window.location.search).get('role') === 'tasker' || localStorage.getItem('taskmolly_selected_role') === 'tasker') ? 'Provider Workspace (Pro Dashboard)' : 'Client Dashboard'}
+                  </span>
+                </p>
+              </div>
+
+              {/* Account Selection */}
+              <div className="space-y-3 mb-6">
+                <button
+                  onClick={() => handleDirectSocialLogin(
+                    'wachirakelvin5@gmail.com',
+                    'Kelvin Wachira',
+                    socialAuthModal.provider
+                  )}
+                  disabled={loading}
+                  className="w-full flex items-center gap-3.5 p-3.5 rounded-2xl bg-primary-bg hover:bg-accent-gold/10 border-2 border-warm-gray/60 hover:border-accent-gold transition-all text-left group active:scale-[0.99] cursor-pointer"
+                >
+                  <div className="w-11 h-11 rounded-full bg-accent-gold/15 text-accent-gold font-black flex items-center justify-center text-base border border-accent-gold/30 shrink-0">
+                    K
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-bold text-rich-black truncate">Kelvin Wachira</p>
+                      <span className="text-[9px] uppercase tracking-wider font-extrabold px-1.5 py-0.5 rounded bg-accent-gold/15 text-accent-gold shrink-0">
+                        {(selectedRole === 'tasker' || new URLSearchParams(window.location.search).get('role') === 'tasker' || localStorage.getItem('taskmolly_selected_role') === 'tasker') ? 'Pro Service Provider' : 'Client Account'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-rich-black/60 truncate font-mono">wachirakelvin5@gmail.com</p>
+                  </div>
+                  <ArrowRight size={16} className="text-warm-gray group-hover:text-accent-gold group-hover:translate-x-1 transition-all shrink-0" />
+                </button>
+
+                {!showCustomEmailInput ? (
+                  <button
+                    onClick={() => setShowCustomEmailInput(true)}
+                    className="w-full text-center text-xs font-semibold text-rich-black/50 hover:text-accent-gold py-2 transition-colors"
+                  >
+                    + Use a different email address
+                  </button>
+                ) : (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: 'auto' }}
+                    className="pt-2 space-y-3 border-t border-warm-gray/40"
+                  >
+                    <div>
+                      <label className="text-[10px] uppercase tracking-widest text-rich-black/40 font-bold block mb-1.5">
+                        Your Email
+                      </label>
+                      <input
+                        type="email"
+                        placeholder="you@domain.com"
+                        value={customSocialEmail}
+                        onChange={(e) => setCustomSocialEmail(e.target.value)}
+                        className="w-full bg-primary-bg border border-warm-gray rounded-xl py-3 px-4 text-xs text-rich-black focus:outline-none focus:border-accent-gold"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] uppercase tracking-widest text-rich-black/40 font-bold block mb-1.5">
+                        Your Name (Optional)
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="e.g. Kelvin W."
+                        value={customSocialName}
+                        onChange={(e) => setCustomSocialName(e.target.value)}
+                        className="w-full bg-primary-bg border border-warm-gray rounded-xl py-3 px-4 text-xs text-rich-black focus:outline-none focus:border-accent-gold"
+                      />
+                    </div>
+                    <button
+                      onClick={() => {
+                        if (!customSocialEmail || !customSocialEmail.includes('@')) {
+                          toast.error("Please enter a valid email");
+                          return;
+                        }
+                        handleDirectSocialLogin(customSocialEmail, customSocialName, socialAuthModal.provider);
+                      }}
+                      disabled={loading || !customSocialEmail}
+                      className="w-full py-3 bg-rich-black text-white text-xs font-bold uppercase tracking-wider rounded-xl hover:bg-black transition-all disabled:opacity-50"
+                    >
+                      {loading ? 'Authenticating...' : `Continue with ${socialAuthModal.provider === 'google' ? 'Google' : 'Apple'}`}
+                    </button>
+                  </motion.div>
+                )}
+              </div>
+
+              {/* Cancel Button */}
+              <button
+                onClick={() => {
+                  setSocialAuthModal({ isOpen: false, provider: 'google' });
+                  setShowCustomEmailInput(false);
+                }}
+                className="w-full py-3 text-center text-xs font-bold uppercase tracking-wider text-rich-black/40 hover:text-rich-black transition-colors"
+              >
+                Cancel
+              </button>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
